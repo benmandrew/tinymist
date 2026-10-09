@@ -71,47 +71,74 @@ function reuseOrPatchElem(prev: SVGGElement, next: SVGGElement) {
   return false /* reused */;
 }
 
-interface FrozenReplacement {
+export interface FrozenReplacement {
   inserts: Element[][];
   debug?: string;
 }
 
-function preReplaceNonSVGElements(prev: Element, next: Element): FrozenReplacement {
-  const removedIndices: number[] = [];
+/// Split the children of `elem` into the runs of non-`<g>` elements between
+/// its `<g>` children. There is always one more run than `<g>` children.
+function nonGElementRuns(elem: Element): Element[][] {
+  const runs: Element[][] = [];
+  let elements: Element[] = [];
+  for (const child of Array.from(elem.children)) {
+    if (!isGElem(child)) {
+      elements.push(child);
+    } else {
+      runs.push(elements);
+      elements = [];
+    }
+  }
+  runs.push(elements);
+  return runs;
+}
+
+/// Patch a run of non-`<g>` elements in place, keeping every `prev` element
+/// that equals its counterpart in `next`. Replacing an equal `<clipPath>` or
+/// `<rect>` still invalidates the paint of every element that references it,
+/// so only changed elements are swapped. Return the elements now in the DOM,
+/// or undefined, without touching the DOM, if the runs differ in length.
+function patchNonGElementRunInPlace(prevRun: Element[], nextRun: Element[]): Element[] | undefined {
+  if (prevRun.length !== nextRun.length) {
+    return undefined;
+  }
+  return prevRun.map((prevElem, i) => {
+    if (prevElem.isEqualNode(nextRun[i])) {
+      return prevElem;
+    }
+    prevElem.replaceWith(nextRun[i]);
+    return nextRun[i];
+  });
+}
+
+export function preReplaceNonSVGElements(prev: Element, next: Element): FrozenReplacement {
   const frozenReplacement: FrozenReplacement = {
-    inserts: [],
+    inserts: nonGElementRuns(next),
     //     debug: `preReplaceNonSVGElements ${since}
     // prev: ${prev.outerHTML}
     // next: ${next.outerHTML}`
   };
-  for (let i = 0; i < prev.children.length; i++) {
-    const prevChild = prev.children[i];
-    if (!isGElem(prevChild)) {
-      removedIndices.push(i);
+
+  /// The leading run can stay in the DOM while `<g>` children are patched,
+  /// since `changeViewPerspective` keeps non-`<g>` elements before the first
+  /// `<g>` in place. Other runs have no stable position and are replaced.
+  const kept = new Set(
+    patchNonGElementRunInPlace(nonGElementRuns(prev)[0], frozenReplacement.inserts[0]),
+  );
+  if (kept.size) {
+    frozenReplacement.inserts[0] = [];
+  }
+
+  for (const prevChild of Array.from(prev.children)) {
+    if (!isGElem(prevChild) && !kept.has(prevChild)) {
+      prevChild.remove();
     }
   }
-
-  for (const index of removedIndices.reverse()) {
-    prev.children[index].remove();
-  }
-
-  let elements: Element[] = [];
-  for (let i = 0; i < next.children.length; i++) {
-    const nextChild = next.children[i];
-    if (!isGElem(nextChild)) {
-      elements.push(nextChild);
-    } else {
-      frozenReplacement.inserts.push(elements);
-      elements = [];
-    }
-  }
-
-  frozenReplacement.inserts.push(elements);
 
   return frozenReplacement;
 }
 
-function postReplaceNonSVGElements(prev: Element, frozen: FrozenReplacement) {
+export function postReplaceNonSVGElements(prev: Element, frozen: FrozenReplacement) {
   /// Retrieve the `<g>` elements from the `prev` element.
   const gElements = Array.from(prev.children).filter(isGElem);
   if (gElements.length + 1 !== frozen.inserts.length) {
