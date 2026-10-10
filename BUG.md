@@ -159,13 +159,40 @@ The run used headless sway with `JUMP=1 PAUSES=5`. Of 464 samples, 378 were busy
 
 **GPU configuration.** CDP `SystemInfo.getInfo` reports `skiaBackendType` as `GaneshGL`. GL goes through the Almost Native Graphics Layer Engine (ANGLE) on OpenGL (`angle=opengl`), and `skia_graphite` is `disabled_off`. The active driver workarounds include `msaa_is_slow`, which concerns multisample anti-aliasing (MSAA), and `maxMsaaSamples` is 16.
 
+**Flag tests.** Two follow-up tests ran on 2026-10-10: one lifted the driver workarounds, and one tried to switch Skia to *Graphite*, its other back end in Chrome. All runs used headless sway with `JUMP=1 PAUSES=5`, and the trace had the Skia categories plus `toplevel`. "Busy" is the summed length of the top-level trace spans on `CrGpuMain`. The first two configurations had two runs each, and `--disable-gpu-rasterization` had one.
+
+| Configuration | `TriangulatingPathOp` | `Flush` total | `SkCanvas::drawPath` total | `CrGpuMain` busy | Longest `CrGpuMain` span |
+| --- | --- | --- | --- | --- | --- |
+| default | 44,652 ops, 1,038 and 1,036 ms | 1,107 and 1,084 ms | 212 and 210 ms | 1,293 and 1,283 ms | 160 and 163 ms |
+| `--disable-gpu-driver-bug-workarounds` | 0 | 397 and 404 ms | 757 and 788 ms | 1,254 and 1,299 ms | 168 and 185 ms |
+| `--disable-gpu-rasterization` | 0 | not applicable | not applicable | 34 ms | 0.9 ms |
+
+**Driver workarounds.** With `--disable-gpu-driver-bug-workarounds`, Chrome reported 0 active workarounds, so `msaa_is_slow` was off. The trace then held no `TriangulatingPathOp` events. A driver workaround therefore selects the triangulating path renderer. The flag lifts all seven workarounds at once, so the test does not separate `msaa_is_slow` from the other six.
+
+The flag does not help. The CPU work moves out of the flush and into `SkCanvas::drawPath`, and it stays on `CrGpuMain`. The flush total falls from 1,107 and 1,084 ms to 397 and 404 ms, while the `drawPath` total rises from 212 and 210 ms to 757 and 788 ms. Of that `drawPath` time, 642 and 663 ms are under `SurfaceDrawContext::internalDrawPath`. The busy time and the longest span are unchanged within run-to-run variation. The trace does not name the path renderer that does this work.
+
+**Graphite.** Graphite does not start on this machine with Chrome 154 and Mesa 23.2.1, so it could not be tested. The first attempts ran under headless sway with `JUMP=1 PAUSES=5`. `--enable-features=SkiaGraphite` alone left `skiaBackendType` at `GaneshGL`. `--enable-skia-graphite` made Chrome report `GraphiteDawnVulkan` while the trace still showed the same 44,652 Ganesh `TriangulatingPathOp` events, and adding `--enable-features=Vulkan,SkiaGraphite --use-angle=vulkan` left `CrGpuMain` with 2 ms of work and raster on the renderer's worker threads.
+
+The last two flag sets were then repeated on 2026-10-10 in a windowed GNOME Wayland session, with a 1000 px/s wheel scroll of `scroll-bench/doc.typ`. Both gave the same outcome as under headless sway:
+
+- `--enable-skia-graphite`: Chrome reported `GraphiteDawnVulkan`, but the GPU process in the trace had a later process id than the renderer, so it had been restarted. Raster ran on Ganesh as before, with 228,458 `TriangulatingPathOp` events totalling 5,456 ms and `CrGpuMain` busy for 6,827 ms. The default run in the same session had `CrGpuMain` busy for 6,687 ms and a `DoEndRasterCHROMIUM::Flush` total of 5,506 ms.
+- `--enable-skia-graphite --enable-features=Vulkan,SkiaGraphite --use-angle=vulkan`: Chrome's log, taken with `--enable-logging=stderr`, shows the GPU process crashing 6 times during start-up. Three exits had code 133. Three more had code 8704, after `Internal Vulkan error (-8): A requested feature is not supported` in ANGLE's `DmaBufImageSiblingVkLinux.cpp`. Chrome then fell back to CPU raster in the renderer, with 1,093 ms of `ZeroCopyRasterBuffer::Playback` on worker threads.
+
+The reported back end comes from the first GPU process. The trace shows what the surviving process uses, so the trace is the record to check. Neither run measured Graphite.
+
+The machine also has an NVIDIA GPU (`3D controller`, PCI 01:00.0), and both the Intel and the NVIDIA Vulkan drivers are installed. Which Vulkan device Chrome picked was not checked.
+
+The frame rates of these windowed runs should not be compared with the earlier ones. The compositor reached only 5.0 swaps per second in the default run, against 33.5 in the windowed runs of 2026-10-09. The session had been unlocked remotely over SSH with nobody at the machine, and the cause of the difference was not investigated. The `CrGpuMain` totals above remain valid as a comparison within the session.
+
+**Renderer main thread.** `CrRendererMain` was busy for about 4.2 s of the run in every configuration, with a longest span over 500 ms. The default run had 4,194 ms busy and a longest span of 561 ms, and the CPU raster fallback run had 4,144 ms and 526 ms. This is the separate main-thread problem described under "The renderer main thread is saturated in every configuration" above.
+
 **Still open.** Three points are untested:
 
-- Whether `msaa_is_slow` is what makes Ganesh choose the triangulating path renderer on this machine.
+- Which path renderer runs when the workarounds are lifted.
+- Whether Graphite avoids the CPU cost per glyph. Graphite fails to start on this machine with Chrome 154 and Mesa 23.2.1, so a test needs a machine or a driver version where it starts.
 - Which Skia back end the M1 run used. It was not recorded.
-- Whether Graphite, or lifting the workaround, removes the cost.
 
-The next test reruns the benchmark with `--enable-features=SkiaGraphite`, and separately with `--disable-gpu-driver-bug-workarounds`, and compares the `TriangulatingPathOp` totals.
+No Chrome flag tested so far keeps GPU raster and removes the cost, so `--disable-gpu-rasterization` remains the only working workaround. A fix on the tinymist side would have to cut the number of glyph paths that Chrome draws per tile.
 
 ### Step 5: `isEqualNode` fix (2026-10-09)
 
