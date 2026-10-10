@@ -1,4 +1,4 @@
-# Bug: preview scroll stutter on Intel GPU with Mesa
+# Bug: preview scroll stutter
 
 This file hands off an open investigation into scroll stutter in the Typst preview. The candidate causes come from reading code on macOS. The figures in "Measurements on macOS (Apple M1)" come from scripted runs on an M1 machine. Nothing has been measured on the affected Ubuntu machine yet. Each cause listed is a hypothesis until the tests in "Next steps" confirm or reject it.
 
