@@ -13,7 +13,7 @@ The preview has two layers of frontend code.
 - `tools/typst-preview-frontend/src/` is the preview frontend. `ws.ts` sets up the document and event wiring, `typst.ts` adds hover and link handlers, and `typst.css` holds the styles.
 - `tools/typst-dom/src/` is the Document Object Model (DOM) renderer library. `typst-doc.mts` owns the render queue and wheel/zoom handling. `typst-doc.svg.mts` implements Scalable Vector Graphics (SVG) mode, `typst-doc.canvas.mts` implements canvas mode, and `typst-patch.svg.mts` does SVG diff patching.
 
-The document renders as one large `<svg>` inside `#typst-app`. Every glyph is an *outline path* (`<path>`) referenced through `<use>`, never as text. Each page carries a `clip-path`, and each glyph has the Cascading Style Sheets (CSS) rule `transform: matrix(1,0,0,1,var(--o),0)` from `typst.css`.
+The document renders as one large `<svg>` inside `#typst-app`. Every glyph is an *outline path* (`<path>`) referenced through `<use>`, never as text. Each page carries a `clip-path`. `typst.css` also gives glyph paths the Cascading Style Sheets (CSS) rule `transform: matrix(1,0,0,1,var(--o),0)`, but nothing sets `--o`, so the rule computes to `none` and adds no transform.
 
 With *partial rendering* on, off-screen pages become `<canvas>` elements inside `<foreignObject>` at `pixelPerPt = 3` (`typst-doc.mts:91`). An A4 page comes out at roughly 1785×2526 px. The user's test with partial rendering off rules these canvases out as the main cause.
 
