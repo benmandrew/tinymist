@@ -1,10 +1,10 @@
 # Bug: preview scroll stutter on Intel GPU with Mesa
 
-This file hands off an open investigation into scroll stutter in the Typst preview. Everything below comes from reading code on macOS, not from the affected machine. Nothing has been measured there yet. Each cause listed is a hypothesis until the tests in "Next steps" confirm or reject it.
+This file hands off an open investigation into scroll stutter in the Typst preview. The candidate causes come from reading code on macOS. The figures in "Measurements on macOS (Apple M1)" come from scripted runs on an M1 machine. Nothing has been measured on the affected Ubuntu machine yet. Each cause listed is a hypothesis until the tests in "Next steps" confirm or reject it.
 
 ## Symptom
 
-The Typst preview *webview* in the tinymist VS Code extension stutters when scrolling on Ubuntu with an Intel graphics processing unit (GPU) running the Mesa driver. The stutter disappears when VS Code renders on the central processing unit (CPU). It appears during continuous scrolling with no pauses, and also around pauses. Turning off `tinymist.preview.partialRendering` (default `true`) made no difference.
+The Typst preview *webview* in the tinymist VS Code extension stutters when scrolling. It was first observed on Ubuntu with an Intel graphics processing unit (GPU) running the Mesa driver. Nothing yet shows that it is specific to that platform. The stutter disappears when VS Code renders on the central processing unit (CPU). It appears during continuous scrolling with no pauses, and also around pauses. Turning off `tinymist.preview.partialRendering` (default `true`) made no difference.
 
 ## Architecture
 
@@ -50,6 +50,47 @@ Run these in order. Steps 1 to 4 are tests, and step 5 is a fix to make whatever
 3. **Performance trace.** In the Performance tab, record a short scroll. Long raster tasks on the GPU thread point to cause 1. Wheel input waiting on a busy main thread points to cause 2.
 4. **Canvas render mode.** typst-dom has a canvas render mode (`typst-doc.canvas.mts`) that draws each page to a bitmap once, so scrolling only composites finished images. The preview never enables it, because `createSvgDocument` in `ws.ts` (near line 56) does not pass `renderMode`. Pass `renderMode: "canvas"` there, rebuild with `yarn build:preview`, and compare. Text selection and some cursor features only work in SVG mode, so this is a diagnostic build only.
 5. **Fix the redraw after each pause.** Apply the `isEqualNode` fix from the section above, whatever the other tests show.
+
+## Measurements on macOS (Apple M1)
+
+These measurements come from an Apple M1 machine, not the affected Ubuntu machine. The "Limits" list below records where the setup differs from the user's.
+
+### Setup
+
+- Server: tinymist v0.15.8, using the binary from the installed VS Code extension, launched as `tinymist preview --no-open --partial-rendering <true|false> --data-plane-host 127.0.0.1:23625 main.typ`.
+- Test document: 50 A4 pages of lorem text in 40 sections, with an equation and a 4×4 table in each section.
+- Browser: Google Chrome rather than the VS Code *Electron* webview, in a 1200×950 window with `devicePixelRatio` 2. The Chrome DevTools Protocol drove the browser.
+- Input: `Input.synthesizeScrollGesture` with the mouse-wheel source.
+- Continuous phase: one 20,000 px scroll at 2000 px/s, lasting about 10 s.
+- Pause phase: five 1,500 px scrolls, each followed by a 1.2 s pause. Each pause is longer than the 500 ms debounce.
+- Instrumentation: a full Chrome trace was recorded. Scroll smoothness comes from Chrome's own `ScrollJankV4` trace events. Main-thread frame rate comes from a `requestAnimationFrame` loop. Post-pause blocking comes from *Long Animation Frame* entries.
+
+### Results
+
+| Partial rendering | Chrome flags | Main-thread frames during continuous scroll | Janky scroll frames | Main-thread block after each pause |
+| --- | --- | --- | --- | --- |
+| on | none | 60/s | 0 / 600 | 63–76 ms |
+| on | `--disable-gpu-rasterization` | 60/s | 0 / 600 | 50–148 ms |
+| on | `--disable-gpu` | 60/s | 0 / 601 | 51–72 ms |
+| off | none | 6/s | 0 / 599 | 134–166 ms |
+| off | `--disable-gpu-rasterization` | 6/s | 0 / 600 | 134–175 ms |
+| off | `--disable-gpu` | 6/s | 0 / 601 | 130–162 ms |
+
+### Findings
+
+1. **Scrolling stayed smooth.** All six configurations scrolled smoothly by Chrome's *jank* metric. Every scroll frame landed on the next *vsync* (vertical sync), 16.7 ms apart on this 60 Hz display. The stutter did not reproduce on the M1.
+2. **Partial rendering off saturates the main thread.** With partial rendering off, the renderer main thread managed 6 frames per second during scrolling, whatever the GPU flags. Each main frame took about 250 ms. About 67 ms of that was `Paint`, and about 160 ms was `Layerize` (`PaintArtifactCompositor::Update`). The compositor still carried the scroll on the M1, but a slower CPU has less margin. This fits the Ubuntu report that turning partial rendering off made no difference. The reason Chrome repaints during a compositor-driven scroll is not yet known.
+3. **The redraw after each pause is confirmed.** Each pause produced exactly one long main-thread frame. It lasted 130–175 ms with partial rendering off and 50–148 ms with it on, mostly 60–76 ms. The JavaScript `rerender` timing logged only 2–11 ms of that. Most of the cost is therefore Chrome repainting after the DOM replacement, which is consistent with the `clipPath` replacement theory above. The long frame landed after each scroll ended, so it did not register as scroll jank.
+4. **GPU rasterisation is cheap on the M1.** With partial rendering on, `RasterTask` events totalled 17 ms over the whole run. With `--disable-gpu-rasterization`, raster tasks totalled about 2 s, and single tasks on background threads took up to 419 ms. Scrolling still showed no jank. Cause 1, GPU rasterisation under Mesa, cannot be tested on the M1.
+5. **The non-passive wheel listener cost little.** The first wheel event of each gesture reached the main thread within 1–16 ms. Chrome blocks only on the first wheel event of a scroll sequence, so cause 2 added little delay here.
+
+### Limits
+
+- Chrome stood in for the VS Code Electron webview.
+- Input was synthetic wheel scrolling at a fixed speed, not a real trackpad.
+- The jank metric does not count *checkerboarding*, where tiles show blank because they are not yet rasterised.
+- Cause 3 (hover repaints) is untested, because synthetic wheel input never moves the pointer.
+- The standalone command-line interface (CLI) defaults to partial rendering off, whereas VS Code defaults to on.
 
 ## Results
 
