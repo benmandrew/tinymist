@@ -21,7 +21,7 @@ With *partial rendering* on, off-screen pages become `<canvas>` elements inside 
 
 No tinymist JavaScript runs during a continuous scroll. The scroll listener at `tools/typst-preview-frontend/src/ws.ts:78-80` is *debounced* by 500 ms, so it fires only after scrolling stops. Most of the work during a scroll is therefore Chromium *rasterising* newly exposed *tiles*.
 
-1. **Vector rasterisation.** This is the leading hypothesis. Every newly exposed tile requires drawing every glyph path that falls inside it. The suspicion is that GPU path rasterisation under Mesa on Intel hardware costs more than CPU rasterisation of the same content. A small GPU memory budget would also make Chromium evict off-screen tiles and redraw them when they return. Both fit "smooth on CPU, stutters on GPU".
+1. **Vector rasterisation.** This is the leading hypothesis. Every newly exposed tile requires drawing every glyph path that falls inside it. The suspicion is that GPU path rasterisation under Mesa on Intel hardware costs more than CPU rasterisation of the same content. A small GPU memory budget would also make Chromium evict off-screen tiles and redraw them when they return. Both fit "smooth on CPU, stutters on GPU". Later measurements place the cost on the CPU, in Chrome's GPU process, and exclude the Mesa driver (see "What the long flushes do (2026-10-10)").
 2. **Non-passive wheel listener.** `tools/typst-dom/src/typst-doc.mts:332` registers `wheel` on `window` with `passive: false`, so the handler near line 300 can implement Ctrl+wheel zoom. A *non-passive listener* forces Chromium to send each wheel event to the main thread and wait for it before scrolling. Any busy period on the main thread then delays the scroll. Making the listener passive would break Ctrl+wheel zoom and trackpad pinch-zoom, so this fix is not trivial.
 3. **Hover repaints.** `.typst-text:hover` changes glyph fill in `typst.css`, and `tools/typst-preview-frontend/src/typst.ts:102` adds a `hover` class on `mousemove`. The suspicion is that, with the pointer over the preview during a scroll, text passing under it triggers repaints.
 
@@ -122,13 +122,50 @@ The second `--disable-gpu-rasterization` run was lost to a harness bug. At 2000 
 
 Two separate problems show in the traces.
 
-**GPU raster blocks the GPU main thread.** With GPU raster on, `CrGpuMain` spends 100–310 ms at a time in `RasterDecoderImpl::DoEndRasterCHROMIUM::Flush`, rasterising glyph paths. Display swaps queue behind those flushes, so the compositor misses frames even though the scroll itself runs off the main thread. With `--disable-gpu-rasterization`, raster moves to the renderer's worker threads and `CrGpuMain` has no long tasks. This confirms cause 1. The user's `~/.local/bin/code` wrapper already passes `--disable-gpu-rasterization` as a workaround.
+**GPU raster blocks the GPU main thread.** With GPU raster on, `CrGpuMain` spends 100–310 ms at a time in `RasterDecoderImpl::DoEndRasterCHROMIUM::Flush`, drawing the glyph paths of new tiles. "What the long flushes do (2026-10-10)" below shows that this time is CPU work inside Chrome. Display swaps queue behind those flushes, so the compositor misses frames even though the scroll itself runs off the main thread. With `--disable-gpu-rasterization`, raster moves to the renderer's worker threads and `CrGpuMain` has no long tasks. This confirms cause 1. The user's `~/.local/bin/code` wrapper already passes `--disable-gpu-rasterization` as a workaround.
 
 **The renderer main thread is saturated in every configuration.** During the scroll each main frame takes 500–870 ms, nearly all in `Paint` and `Layerize`, while `PaintInvalidator` reports only 5 invalidations per frame. The cause of the per-frame repaint is still open. Cull-rect updates as the scroll offset moves are the likely trigger, since `CullRectUpdate` runs in every slow frame. Glyphs reach the paint step as separate `<use>` instances, each with its own `x` translation. That makes the paint chunk count, and so the cost of `Layerize`, scale with the glyph count. This was not measured directly. The `transform: matrix(1,0,0,1,var(--o),0)` rule in `typst.css` is excluded, because `--o` is never set and the rule computes to `none`.
 
 The saturated main thread feeds the "redraw after each pause" issue. Scroll events reach the page once per main frame, so frames over 500 ms let the 500 ms debounce in `ws.ts` fire during a continuous scroll. With GPU raster on, `doUpdate` ran twice mid-scroll in every run. Each of those main frames took 2.2–2.5 s, with about 383,000 `PaintInvalidator` calls after the `typst-page-inner` rects and clip paths were rebuilt.
 
 Hover is excluded as a cause. With `pointer-events: none` forced on everything under `#typst-app`, the main thread still produced 13 frames over 50 ms out of 29.
+
+### What the long flushes do (2026-10-10)
+
+The long flushes are CPU work in Chrome's own code. Skia turns each glyph path into triangles on the GPU process main thread, and the step that issues the draw calls takes about 4% of the flush time. The open question was why one `RasterDecoderImpl::DoEndRasterCHROMIUM::Flush` takes 100–310 ms on this machine and at most 1.1 ms on the Apple M1. Two explanations were possible: `CrGpuMain` computes for that time, or it waits on the Mesa driver. All figures below come from the Intel machine (Raptor Lake-P, Mesa 23.2.1, Chrome 154).
+
+**Wall time against CPU time.** Chrome trace events carry `dur`, the wall time, and `tdur`, the CPU time of the thread. In the saved default-flags wheel-scroll trace of 2026-10-09, `CrGpuMain` ran 48 `DoEndRasterCHROMIUM::Flush` events with 2,593 ms of `dur` and 2,577 ms of `tdur`, a ratio of 0.99. The five longest parent `CommandBuffer::Flush` events took 310, 301, 257, 255 and 249 ms of `dur` against 295, 301, 257, 255 and 249 ms of `tdur`. During the longest one, no other thread in the GPU process ran more than 2.3 ms of traced work. The thread is computing. Waiting on the driver is excluded.
+
+**Stack samples.** `perf` was not available, because `kernel.perf_event_paranoid` is 4 on this machine and changing it needs root. Instead, `gdb` ran the GPU process as its own child through Chrome's `--gpu-launcher` flag. A script interrupted the process every 15 ms and recorded the stack of the main thread:
+
+```sh
+--gpu-launcher="gdb -q -batch -x sampler.py --args" --disable-gpu-sandbox --disable-gpu-watchdog
+```
+
+The run used headless sway with `JUMP=1 PAUSES=5`. Of 464 samples, 378 were busy and the rest were waiting on a *futex*. 353 of the busy samples had return addresses inside the `chrome` binary, and 2 had any address inside `iris_dri.so`, the Mesa Intel driver. 102 samples were in the `floor` function of libm, called from `chrome`. Chrome is stripped, so the samples give no function names. The CPU time is in Chrome's own code and Mesa is excluded.
+
+**Skia trace.** The same jump run was repeated with the trace categories `disabled-by-default-skia` and `disabled-by-default-skia.gpu` added. Jump mode exposes less area per flush than the wheel scroll, so single flushes are shorter than the 100–310 ms above. The longest took 52 ms.
+
+| Trace event | Count | Total |
+| --- | --- | --- |
+| `DoEndRasterCHROMIUM::Flush` | 40 | 1,084 ms |
+| `OpsTask::onPrepare` | 40 | 1,034 ms |
+| `TriangulatingPathOp` | 44,652 | 1,052 ms |
+| `OpsTask::onExecute` | 40 | 45 ms |
+| `FillRectOp` | 160 | 2.0 ms |
+| `AAConvexPathOp` | 368 | 1.4 ms |
+
+`TriangulatingPathOp` takes 97% of the flush time, at about 24 µs per event. `OpsTask::onExecute` is the step that issues the OpenGL (GL) draw calls, and it takes about 4%. Skia's Ganesh back end *triangulates* each glyph path on the CPU, on the GPU process main thread. It makes one op per glyph, and it repeats the work every time a tile is rasterised.
+
+**GPU configuration.** CDP `SystemInfo.getInfo` reports `skiaBackendType` as `GaneshGL`. GL goes through the Almost Native Graphics Layer Engine (ANGLE) on OpenGL (`angle=opengl`), and `skia_graphite` is `disabled_off`. The active driver workarounds include `msaa_is_slow`, which concerns multisample anti-aliasing (MSAA), and `maxMsaaSamples` is 16.
+
+**Still open.** Three points are untested:
+
+- Whether `msaa_is_slow` is what makes Ganesh choose the triangulating path renderer on this machine.
+- Which Skia back end the M1 run used. It was not recorded.
+- Whether Graphite, or lifting the workaround, removes the cost.
+
+The next test reruns the benchmark with `--enable-features=SkiaGraphite`, and separately with `--disable-gpu-driver-bug-workarounds`, and compares the `TriangulatingPathOp` totals.
 
 ### Step 5: `isEqualNode` fix (2026-10-09)
 
